@@ -1,0 +1,228 @@
+name: M-Star CFD Build Pipeline
+on:
+  push:
+    branches: [ "feature/build-pipeline" ]
+  pull_request:
+    branches: [ "feature/build-pipeline" ]
+  workflow_dispatch:
+
+env:
+  # Common environment variables
+  AWS_REGION: us-east-1
+  DOCKER_REGISTRY: public.ecr.aws
+  BUILD_DIR: /tmp/build
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix:
+        platform: [ubuntu-20.04, ubuntu-22.04]
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Setup Docker Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y docker.io git make build-essential curl
+        sudo systemctl start docker
+        sudo usermod -aG docker ${{ github.actor }}
+        
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Docker Credentials
+      run: |
+        echo "${{ secrets.DOCKER_REGISTRY_TOKEN }}" | docker login -u ${{ secrets.DOCKER_REGISTRY_USER }} --password-stdin ${{ env.DOCKER_REGISTRY }}
+        
+    - name: Clone All Repositories
+      run: |
+        mkdir -p ${{ env.BUILD_DIR }}
+        cd ${{ env.BUILD_DIR }}
+        
+        # Clone repositories based on your Buildbot configuration
+        git clone git@git.mstarcfd.com:mstar-solve.git mstar-solve
+        git clone git@git.mstarcfd.com:mstar-gui.git mstar-gui
+        git clone git@git.mstarcfd.com:mstar-installer.git mstar-installer
+        git clone git@git.mstarcfd.com:mstar-downloads.git mstar-downloads
+        git clone git@git.mstarcfd.com:mstar-docs.git mstar-docs
+        git clone gitlab.com:mstarcfd/mstar-post.git mstar-post
+        git clone gitlab.com:mstarcfd/paraview-superbuild.git paraview-superbuild
+        
+    - name: Build Components (Linux)
+      run: |
+        cd ${{ env.BUILD_DIR }}
+        
+        # Clean output directory
+        rm -rf output
+        mkdir -p output
+        
+        # Run Linux build script (equivalent to make_linux_packages.py)
+        echo "Building Linux components..."
+        python mstar-installer/make_linux_packages.py
+        
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-build-artifacts
+        path: ${{ env.BUILD_DIR }}/output/
+        
+  build-windows:
+    runs-on: windows-2019
+    strategy:
+      matrix:
+        platform: [windows-2019, windows-2022]
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Setup Build Environment
+      run: |
+        # Install required tools for Windows build
+        choco install git python3 visualstudio2017-workload-vctools
+        python -m pip install --upgrade pip
+        
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Clone All Repositories
+      run: |
+        mkdir -p ${{ env.BUILD_DIR }}
+        cd ${{ env.BUILD_DIR }}
+        
+        # Clone repositories based on your Buildbot configuration
+        git clone git@git.mstarcfd.com:mstar-solve.git mstar-solve
+        git clone git@git.mstarcfd.com:mstar-gui.git mstar-gui
+        git clone git@git.mstarcfd.com:mstar-installer.git mstar-installer
+        git clone git@git.mstarcfd.com:mstar-downloads.git mstar-downloads
+        git clone git@git.mstarcfd.com:mstar-docs.git mstar-docs
+        git clone gitlab.com:mstarcfd/mstar-post.git mstar-post
+        git clone gitlab.com:mstarcfd/paraview-superbuild.git paraview-superbuild
+        
+    - name: Build Components (Windows)
+      run: |
+        cd ${{ env.BUILD_DIR }}
+        
+        # Clean output directory
+        Remove-Item -Recurse -Force output -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path output
+        
+        # Run Windows build script with Visual Studio environment
+        echo "Building Windows components..."
+        # Set up Visual Studio environment
+        $vsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2017\Professional\VC\Auxiliary\Build\vcvars64.bat"
+        if (Test-Path $vsPath) {
+            cmd /c "call `"$vsPath`" && python mstar-installer/make_windows_package.py"
+        } else {
+            echo "Visual Studio not found, continuing with basic build"
+            python mstar-installer/make_windows_package.py
+        }
+        
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-build-artifacts
+        path: ${{ env.BUILD_DIR }}/output/
+        
+  build-docs:
+    runs-on: ubuntu-20.04
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Setup Documentation Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-pip python3-sphinx git
+        pip3 install awscli
+        
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Clone Documentation Repository
+      run: |
+        mkdir -p ${{ env.BUILD_DIR }}
+        cd ${{ env.BUILD_DIR }}
+        git clone git@git.mstarcfd.com:mstar-docs.git mstar-docs
+        
+    - name: Build Documentation
+      run: |
+        cd ${{ env.BUILD_DIR }}/mstar-docs
+        make clean
+        make html
+        
+    - name: Deploy Documentation to S3
+      run: |
+        cd ${{ env.BUILD_DIR }}/mstar-docs
+        aws s3 sync build/build/html/ s3://mstarcfd-docs/ --delete
+        aws cloudfront create-invalidation --distribution-id E3I2FDYS3QGSQM --paths "/*"
+        
+  publish-release:
+    runs-on: ubuntu-20.04
+    needs: [build-linux, build-windows]
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Download Build Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts/
+        
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Publish Release Artifacts
+      run: |
+        # This step would aggregate all artifacts and publish to S3
+        echo "Publishing release artifacts..."
+        mkdir -p ${{ env.BUILD_DIR }}/release
+        cp -r artifacts/*/* ${{ env.BUILD_DIR }}/release/
+        
+        # Upload to S3 (equivalent to upload.py in your Buildbot)
+        aws s3 sync ${{ env.BUILD_DIR }}/release/ s3://your-release-bucket/ --delete
+        
+    - name: Create Release Notes
+      run: |
+        echo "Creating release notes..."
+        # This would generate release.json and other metadata files
+        # Equivalent to make_release_notes.py in Buildbot
+        
+  cleanup:
+    runs-on: ubuntu-20.04
+    needs: [build-linux, build-windows, build-docs, publish-release]
+    
+    steps:
+    - name: Cleanup Resources
+      run: |
+        echo "Cleaning up temporary resources..."
+        # Cleanup operations if needed
